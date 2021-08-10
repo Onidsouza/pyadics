@@ -1,23 +1,22 @@
 from fractions import Fraction
 
-_PADIC_PRECISION = 64  # vamos guardar 10 casas
-_MAX_PADIC_EXPONENT = 16  # val maxima é 10, logo a mínima é -9
+_PADIC_PRECISION = 65  # we're storing 65 p-adic digits
+_MAX_PADIC_EXPONENT = 64  # max valuation is 64, min is -63
 _MIN_PADIC_EXPONENT = 1 - _MAX_PADIC_EXPONENT
-_DISPLAY_CAP = 10  # quando printado, vamos mostra só 10 casas
-_USE_UNICODE = True  # imprime ∞ como unicode na tela?
+_DISPLAY_CAP = 10  # when printed, show first 10 digits
+_USE_UNICODE = True  # should we print ∞ as unicode on screen?
 
 _PRECISION_RANGE = range(0, _PADIC_PRECISION)
 _DISPLAY_RANGE = range(0, _DISPLAY_CAP)
 
 
-def _invmod(a, p, power):  # encontrar um jeito mais rápido usando coeffs
-    # usa Hensel's lemma
+def _invmod(a, p, power):  # is there a faster way to do this?
+    # Hensel's lemma
     c = pow(a, -1, p)
-    if power == 1:
-        return c
-    else:
-        b = _invmod(a, p, power-1)
-        return (b - (a*b - 1)*c) % p**power
+    b = c
+    for i in range(2, power+1):
+        b = (b - (a*b - 1)*c) % p**i
+    return b
 
 
 class PAdicFloat():
@@ -39,16 +38,16 @@ class PAdicFloat():
             return obj
         elif fromrational is not None:
             if isinstance(fromrational, int):
-                obj.exponent = obj._valuationFromInt(fromrational)
+                obj.exponent = cls._valuationFromInt(fromrational, obj.prime)
                 obj.significand = (fromrational // (obj.prime**obj.exponent)) \
                     % (obj.prime ** _PADIC_PRECISION)
                 return obj
             if isinstance(fromrational, Fraction):
                 num = fromrational.numerator
                 dem = fromrational.denominator
-                numval = obj._valuationFromInt(num)
+                numval = cls._valuationFromInt(num, obj.prime)
                 if numval == 0:  # negative valuation
-                    demval = obj._valuationFromInt(dem)
+                    demval = cls._valuationFromInt(dem, obj.prime)
                     unitdem = dem // (obj.prime ** demval)
                     obj.exponent = -demval
                     unitfactor = num
@@ -81,12 +80,13 @@ class PAdicFloat():
                           significand=1,
                           prime=prime)
 
-    def _valuationFromInt(self, i):
+    @classmethod
+    def _valuationFromInt(cls, i, p):
         val = 0
         if i == 0:
             return _MAX_PADIC_EXPONENT
-        while i % self.prime == 0:
-            i = i//self.prime
+        while i % p == 0:
+            i = i // p
             val += 1
         return val
 
@@ -145,7 +145,8 @@ class PAdicFloat():
             exponent = _MAX_PADIC_EXPONENT
             significand = 0  # zero
         else:
-            exponent = self._valuationFromInt(self.significand)
+            exponent = self.__class__._valuationFromInt(self.significand,
+                                                        self.prime)
             significand = (self.significand // (self.prime ** exponent)) \
                 % (self.prime ** _PADIC_PRECISION)
             exponent += self.exponent
@@ -163,9 +164,7 @@ class PAdicFloat():
         b = other.normalize()
         if a.isNaN() or b.isNaN():
             return False
-        return (a.exponent == b.exponent) and \
-               (a.significand == b.significand) and \
-               (a.prime == b.prime)
+        return (a-b).iszero()
 
     def __bool__(self):
         return not self.iszero()
@@ -250,7 +249,8 @@ class PAdicFloat():
             return PAdicFloat.inf(prime=self.prime)
         if (a.exponent == b.exponent):
             # cancellation may happen
-            v = self._valuationFromInt(a.significand + b.significand)
+            v = self.__class__._valuationFromInt(a.significand + b.significand,
+                                                 self.prime)
             if v > _MAX_PADIC_EXPONENT - a.exponent:  # overflow
                 newexp = _MAX_PADIC_EXPONENT
                 newsigs = 0
@@ -261,13 +261,13 @@ class PAdicFloat():
             # non-archimedianess kicks in!
             newexp = b.exponent
             newsigs = (a.significand
-                       // (self.prime**(a.exponent - b.exponent))) \
+                       * (self.prime**(a.exponent - b.exponent))) \
                 + b.significand
         else:
             # non-archimedianess kicks in!
             newexp = a.exponent
             newsigs = (b.significand
-                       // (self.prime**(b.exponent - a.exponent))) \
+                       * (self.prime**(b.exponent - a.exponent))) \
                 + a.significand
         return PAdicFloat(significand=newsigs,
                           exponent=newexp,
@@ -287,3 +287,58 @@ class PAdicFloat():
 
     def __invert__(self):
         return 1/self
+
+
+def plog(padicNumber):
+    t = (padicNumber - 1).normalize()
+    texp = t.exponent
+    tclean = t / (t.prime ** texp)
+    if texp < 1:
+        raise ValueError("p-adic logarithm only defined for 1 + pZp.")
+    log = PAdicFloat(0, prime=t.prime)
+    summand = t
+    powersig = tclean
+    powerexp = texp
+    target = (_MAX_PADIC_EXPONENT // texp) + 1
+    for i in range(2, target+1):
+        log = (log + summand).normalize()
+        powersig *= tclean
+        powerexp += texp
+        iexp = PAdicFloat._valuationFromInt(i, t.prime)
+        ifactor = i // (t.prime ** iexp)
+        factor = PAdicFloat(Fraction(pow(-1, i-1), ifactor), prime=t.prime)
+        scaling = PAdicFloat(t.prime ** (powerexp - iexp), prime=t.prime)
+        summand = ((powersig * factor) * scaling).normalize()
+    return log
+
+
+def pexp(padicNumber):
+    t = padicNumber.normalize()
+    texp = t.exponent
+    tclean = t / (t.prime**texp)
+    if t.prime == 2 and texp < 2:
+        raise ValueError("p-adic exponential only defined for 4Z_2")
+    if t.prime != 2 and texp < 1:
+        raise ValueError("p-adic exponential only defined for pZp")
+    exp = PAdicFloat(0, prime=t.prime)
+    summand = PAdicFloat(1, prime=t.prime)
+    powersig = PAdicFloat(1, prime=t.prime)
+    powerexp = 0
+    # to determine bounts, we use that val_p(n!) ~ n/(p-1)
+    # thus, n*val_p(t) - val_p(n!) ~ n*(val_p(t) - 1/(p-1))
+    # assymptotically.
+    # hence, we sum only up to n = (precision / (vap_p(t) - 1/(p-1))) + 1
+    target = int(_MAX_PADIC_EXPONENT / (t.exponent - 1/(t.prime - 1))) + 1
+    factexp = 0
+    factsig = PAdicFloat(1, prime=t.prime)
+    for i in range(1, target+1):
+        exp = (exp + summand).normalize()
+        powerexp += texp
+        powersig *= tclean
+        iexp = PAdicFloat._valuationFromInt(i, t.prime)
+        factexp += iexp
+        factsig /= (i // (t.prime**iexp))
+        scaling = PAdicFloat(t.prime**(powerexp-factexp),
+                             prime=t.prime).normalize()
+        summand = (scaling * (powersig * factsig)).normalize()
+    return exp
